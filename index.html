@@ -182,10 +182,10 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
 .pt-x:active{background:rgba(220,80,80,0.12)}
 .empty-hint{padding:22px 0;text-align:center;font-size:12px;color:rgba(255,255,255,0.2);line-height:1.9}
 
-/* Actions */
-.acts{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 0 4px}
+.acts-label{font-size:10px;color:rgba(255,255,255,0.22);letter-spacing:0.4px;text-transform:uppercase;margin-top:10px;margin-bottom:4px}
+.acts{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 0 4px}
 .act{
-  padding:13px 8px;border-radius:12px;
+  padding:12px 8px;border-radius:12px;
   border:0.5px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.035);
   font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;
   color:rgba(255,255,255,0.5);cursor:pointer;
@@ -195,6 +195,12 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
 .act:active{background:rgba(255,255,255,0.08)}
 .act.exp{color:#7ec8e3;border-color:rgba(126,200,227,0.16)}
 .act.exp:active{background:rgba(126,200,227,0.07)}
+.act.kml{color:#c8a8f0;border-color:rgba(200,168,240,0.18)}
+.act.kml:active{background:rgba(200,168,240,0.08)}
+.act.shp{color:#f0c87a;border-color:rgba(240,200,122,0.18)}
+.act.shp:active{background:rgba(240,200,122,0.08)}
+.act.rep{color:#a8d870;border-color:rgba(140,210,80,0.2);font-size:13px}
+.act.rep:active{background:rgba(140,210,80,0.07)}
 .act.clr{color:rgba(220,90,90,0.7);border-color:rgba(220,90,90,0.16)}
 .act.clr:active{background:rgba(220,90,90,0.07)}
 
@@ -287,9 +293,13 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
     <div class="empty-hint">Posicione-se no vértice<br>e toque no botão capturar</div>
   </div>
 
+  <div class="acts-label">Exportar</div>
   <div class="acts">
     <button class="act exp" onclick="exportGeoJSON()">↓ GeoJSON</button>
     <button class="act exp" onclick="exportCSV()">↓ CSV</button>
+    <button class="act exp kml" onclick="exportKML()">↓ KML+</button>
+    <button class="act exp shp" onclick="exportShapefile()">↓ Shapefile</button>
+    <button class="act exp rep" style="grid-column:1/-1" onclick="exportRelatorio()">↓ Relatório Topográfico</button>
     <button class="act clr" style="grid-column:1/-1" onclick="clearAll()">✕ Limpar todos os pontos</button>
   </div>
 </div>
@@ -409,8 +419,12 @@ function setListMode(m){
   renderSheet();
 }
 
-// ── GNSS stats panel ──
+// ── GNSS stats panel (throttled: max 1 DOM rebuild/second) ──
+let _panelThrottle=0;
 function updateGnssPanel(acc){
+  const now=Date.now();
+  if(now-_panelThrottle < 1000)return;
+  _panelThrottle=now;
   const hdop=estimateHDOP(acc);
   const sats=estimateSats(acc);
   const cons=detectConstellations();
@@ -458,8 +472,10 @@ function updateGnssPanel(acc){
 // ── GNSS watch ──
 function startWatch(){
   if(!navigator.geolocation)return;
+  // maximumAge:2000 = accept cached fixes up to 2s old for smooth panel updates
+  // timeout:10000 = fail faster if no signal (was 20000)
   watchId=navigator.geolocation.watchPosition(onPos,onErr,
-    {enableHighAccuracy:true,timeout:20000,maximumAge:1000});
+    {enableHighAccuracy:true,timeout:10000,maximumAge:2000});
 }
 function onPos(pos){
   curPos=pos;
@@ -469,18 +485,25 @@ function onPos(pos){
   gnssInfo.rmsAcc.push(ac);
   if(gnssInfo.rmsAcc.length>30)gnssInfo.rmsAcc.shift();
 
-  // Blue position dot + accuracy circle
+  // FIX: reuse existing layers (setLatLng/setRadius) — never remove+recreate on every tick
   if(!posMkr){
     posMkr=L.circleMarker([la,lo],{radius:7,fillColor:'#4a9fe8',fillOpacity:0.92,color:'#fff',weight:2}).addTo(map);
     map.setView([la,lo],17);
-  }else posMkr.setLatLng([la,lo]);
-
-  if(accCircle){map.removeLayer(accCircle);}
-  accCircle=L.circle([la,lo],{radius:ac,color:'#4a9fe8',fillColor:'#4a9fe8',fillOpacity:0.06,weight:0.8,opacity:0.4}).addTo(map);
+  }else{
+    posMkr.setLatLng([la,lo]);
+  }
+  if(!accCircle){
+    accCircle=L.circle([la,lo],{radius:ac,color:'#4a9fe8',fillColor:'#4a9fe8',fillOpacity:0.06,weight:0.8,opacity:0.4}).addTo(map);
+  }else{
+    accCircle.setLatLng([la,lo]);
+    accCircle.setRadius(ac);
+  }
 
   updateGnssPanel(ac);
   updateCurCoord();
-  document.getElementById('peekacc')?document.getElementById('peekacc').textContent='±'+ac.toFixed(1)+'m':null;
+
+  // Notify pending capture listener immediately (instant capture path)
+  if(window._captureListener) window._captureListener(pos);
 }
 function onErr(e){
   const dot=document.getElementById('sig-dot');
@@ -503,30 +526,63 @@ function updateCurCoord(){
 }
 
 // ── Capture ──
+// KEY FIX: use curPos from watchPosition directly (already fresh, <2s old).
+// DO NOT call getCurrentPosition with maximumAge:0 — that forces a cold GPS fix
+// from scratch (up to 20s wait) even though watchPosition already has a live signal.
 function capture(){
   if(!navigator.geolocation){toast('GPS não disponível');return;}
-  if(!watchId)startWatch();
+  if(!watchId){startWatch();} // ensure watch is running
+
+  // If we already have a fresh position (< 3s old), use it instantly
+  if(curPos){
+    const age=(Date.now() - curPos.timestamp);
+    if(age < 3000){
+      _savePoint(curPos);
+      return;
+    }
+  }
+
+  // Otherwise wait for the next watchPosition update (max 4s)
   const fab=document.getElementById('fab');
   fab.classList.add('loading');fab.disabled=true;
-  navigator.geolocation.getCurrentPosition(
-    (pos)=>{
-      onPos(pos);
-      const p={
-        lat:pos.coords.latitude,lon:pos.coords.longitude,
-        alt:pos.coords.altitude,acc:pos.coords.accuracy,
-        hdop:gnssInfo.hdop,
-        rms:gnssInfo.rmsAcc.length>=2?rmsOf(gnssInfo.rmsAcc.slice(-10)):pos.coords.accuracy,
-        ts:new Date().toISOString()
-      };
-      pts.push(p);
-      addMarker(p,pts.length);
-      renderPoly();renderSheet();renderChip();
-      fab.classList.remove('loading');fab.disabled=false;
-      toast('Vértice '+pts.length+' — ±'+p.acc.toFixed(1)+'m  HDOP ~'+p.hdop.toFixed(1));
-    },
-    (e)=>{fab.classList.remove('loading');fab.disabled=false;toast('Erro: '+e.message,3500);},
-    {enableHighAccuracy:true,timeout:20000,maximumAge:0}
-  );
+
+  let done=false;
+  const waitTimer=setTimeout(()=>{
+    // Fallback: if watch is taking too long, try getCurrentPosition
+    // but allow up to 3s cached position (not maximumAge:0)
+    navigator.geolocation.getCurrentPosition(
+      (pos)=>{ if(!done){done=true;onPos(pos);_savePoint(pos);} },
+      (e)=>{ if(!done){done=true;fab.classList.remove('loading');fab.disabled=false;toast('Erro: '+e.message,3500);} },
+      {enableHighAccuracy:true,timeout:8000,maximumAge:3000}
+    );
+  },500);
+
+  // Listen for next watchPosition tick
+  const origOnPos=window._captureListener;
+  window._captureListener=(pos)=>{
+    if(done)return;
+    done=true;
+    clearTimeout(waitTimer);
+    window._captureListener=null;
+    onPos(pos);
+    _savePoint(pos);
+  };
+}
+
+function _savePoint(pos){
+  const fab=document.getElementById('fab');
+  fab.classList.remove('loading');fab.disabled=false;
+  const p={
+    lat:pos.coords.latitude,lon:pos.coords.longitude,
+    alt:pos.coords.altitude,acc:pos.coords.accuracy,
+    hdop:gnssInfo.hdop,
+    rms:gnssInfo.rmsAcc.length>=2?rmsOf(gnssInfo.rmsAcc.slice(-10)):pos.coords.accuracy,
+    ts:new Date().toISOString()
+  };
+  pts.push(p);
+  addMarker(p,pts.length);
+  renderPoly();renderSheet();renderChip();
+  toast('Vértice '+pts.length+' — ±'+p.acc.toFixed(1)+'m  HDOP ~'+(p.hdop?p.hdop.toFixed(1):'?'));
 }
 
 // ── Markers ──
@@ -692,6 +748,467 @@ function exportCSV(){
 function dl(name,content,mime){
   const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([content],{type:mime})),download:name});
   document.body.appendChild(a);a.click();document.body.removeChild(a);
+}
+
+// ── KML+ Export ──
+// KML+ inclui: Polygon preenchido, Placemarks numerados com coordenadas completas,
+// pasta "GNSS Metadata" com linha de rota e ponto centróide, estilo visual completo.
+function exportKML(){
+  if(pts.length<3){toast('Mínimo 3 vértices para KML');return;}
+  const m2=areaM2(pts),ha=m2/10000;
+  const cons=detectConstellations();
+  const rms=pts.length?+(rmsOf(pts.map(p=>p.rms||p.acc))||0).toFixed(3):0;
+  const now=new Date().toISOString();
+  const ts=new Date().toLocaleString('pt-BR');
+
+  // Centroide
+  const cLat=pts.reduce((s,p)=>s+p.lat,0)/pts.length;
+  const cLon=pts.reduce((s,p)=>s+p.lon,0)/pts.length;
+
+  // Coordenadas do polígono fechado
+  const polyCoords=[...pts,pts[0]].map(p=>p.lon.toFixed(8)+','+p.lat.toFixed(8)+','+(p.alt||0).toFixed(1)).join('\n          ');
+  const lineCoords=pts.map(p=>p.lon.toFixed(8)+','+p.lat.toFixed(8)+','+(p.alt||0).toFixed(1)).join('\n          ');
+
+  // Placemarks dos vértices
+  const placemarks=pts.map((p,i)=>{
+    const u=toUTM(p.lat,p.lon);
+    return `
+    <Placemark>
+      <name>V${i+1}</name>
+      <description><![CDATA[
+        <b>Vértice ${i+1}</b><br/>
+        Lat: ${p.lat.toFixed(8)}°<br/>
+        Lon: ${p.lon.toFixed(8)}°<br/>
+        UTM: ${u.zone}${u.hem} E ${Math.round(u.E)} N ${Math.round(u.N)}<br/>
+        Altitude: ${p.alt!=null?p.alt.toFixed(1)+'m':'N/D'}<br/>
+        Precisão: ±${p.acc.toFixed(2)}m<br/>
+        HDOP: ${p.hdop?'~'+p.hdop.toFixed(2):'N/D'}<br/>
+        RMS: ${p.rms?'±'+p.rms.toFixed(3)+'m':'N/D'}<br/>
+        Capturado: ${p.ts.replace('T',' ').substring(0,19)}
+      ]]></description>
+      <styleUrl>#vtx</styleUrl>
+      <Point><coordinates>${p.lon.toFixed(8)},${p.lat.toFixed(8)},${p.alt||0}</coordinates></Point>
+    </Placemark>`;
+  }).join('');
+
+  const kml=`<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"
+     xmlns:gx="http://www.google.com/kml/ext/2.2">
+<Document>
+  <name>TOPOGRAFIA_GNSS</name>
+  <description><![CDATA[
+    Levantamento GNSS - TOPOGRAFIA_GNSS<br/>
+    Data: ${ts}<br/>
+    Sistemas: ${Object.keys(cons).filter(k=>cons[k]).join(', ')}<br/>
+    Vértices: ${pts.length}<br/>
+    Área: ${m2.toFixed(2)} m² / ${ha.toFixed(6)} ha<br/>
+    RMS médio: ±${rms}m
+  ]]></description>
+
+  <!-- Estilos -->
+  <Style id="poly">
+    <LineStyle><color>ff50d418</color><width>2.5</width></LineStyle>
+    <PolyStyle><color>3350d418</color><fill>1</fill><outline>1</outline></PolyStyle>
+  </Style>
+  <Style id="vtx">
+    <IconStyle>
+      <color>ffc8e89a</color><scale>0.9</scale>
+      <Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>
+    </IconStyle>
+    <LabelStyle><scale>0.8</scale></LabelStyle>
+  </Style>
+  <Style id="route">
+    <LineStyle><color>884a9fe8</color><width>1.5</width></LineStyle>
+  </Style>
+  <Style id="centro">
+    <IconStyle><scale>1.1</scale>
+      <Icon><href>http://maps.google.com/mapfiles/kml/paddle/grn-stars.png</href></Icon>
+    </IconStyle>
+  </Style>
+
+  <!-- Polígono da área -->
+  <Folder><name>Área Levantada</name>
+    <Placemark>
+      <name>Parcela GNSS</name>
+      <description><![CDATA[
+        Área: ${m2.toFixed(2)} m²<br/>
+        Área: ${ha.toFixed(6)} ha<br/>
+        Alqueire Paulista: ${(ha/2.42).toFixed(4)}<br/>
+        Alqueire Mineiro: ${(ha/4.84).toFixed(4)}<br/>
+        Vértices: ${pts.length}<br/>
+        RMS médio: ±${rms}m<br/>
+        GNSS: ${Object.keys(cons).filter(k=>cons[k]).join(', ')}
+      ]]></description>
+      <styleUrl>#poly</styleUrl>
+      <Polygon>
+        <extrude>0</extrude><altitudeMode>clampToGround</altitudeMode>
+        <outerBoundaryIs><LinearRing><coordinates>
+          ${polyCoords}
+        </coordinates></LinearRing></outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Folder>
+
+  <!-- Vértices -->
+  <Folder><name>Vértices (${pts.length})</name>${placemarks}
+  </Folder>
+
+  <!-- Metadados GNSS -->
+  <Folder><name>Metadados GNSS</name>
+    <Placemark>
+      <name>Centróide</name>
+      <styleUrl>#centro</styleUrl>
+      <Point><coordinates>${cLon.toFixed(8)},${cLat.toFixed(8)},0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Rota de coleta</name>
+      <styleUrl>#route</styleUrl>
+      <LineString>
+        <tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>
+        <coordinates>
+          ${lineCoords}
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Folder>
+
+</Document>
+</kml>`;
+
+  dl('levantamento_gnss_'+Date.now()+'.kml', kml, 'application/vnd.google-earth.kml+xml');
+  toast('KML+ exportado!');
+}
+
+// ── Shapefile Export ──
+// Gera .zip com os 4 arquivos obrigatórios: .shp .shx .dbf .prj
+// Implementação manual binária (sem biblioteca externa) — WGS84, Polygon type (5)
+function exportShapefile(){
+  if(pts.length<3){toast('Mínimo 3 vértices para Shapefile');return;}
+
+  const coords=[...pts.map(p=>[p.lon,p.lat]),  [pts[0].lon,pts[0].lat]]; // ring fechado
+  const n=coords.length;
+
+  // ── Bounding box ──
+  const lons=pts.map(p=>p.lon), lats=pts.map(p=>p.lat);
+  const xMin=Math.min(...lons),xMax=Math.max(...lons);
+  const yMin=Math.min(...lats),yMax=Math.max(...lats);
+
+  // ── .SHP ──
+  // Header: 100 bytes; Record: 8 bytes header + content
+  // Polygon(5): bbox(32) + numParts(4) + numPoints(4) + parts(4) + points(16*n)
+  const contentLen = 2 + 16 + 2 + 2 + 2 + 8*n; // in 16-bit words
+  const fileLen = 50 + 4 + contentLen;           // in 16-bit words
+  const shpBuf = new ArrayBuffer((fileLen)*2);
+  const shpV = new DataView(shpBuf);
+  // File header (big-endian)
+  shpV.setInt32(0, 9994, false);
+  shpV.setInt32(24, fileLen, false);
+  shpV.setInt32(28, 1000, true);  // version
+  shpV.setInt32(32, 5, true);     // shape type: Polygon
+  shpV.setFloat64(36, xMin, true);
+  shpV.setFloat64(44, yMin, true);
+  shpV.setFloat64(52, xMax, true);
+  shpV.setFloat64(60, yMax, true);
+  shpV.setFloat64(68, 0, true); shpV.setFloat64(76, 0, true);
+  shpV.setFloat64(84, 0, true); shpV.setFloat64(92, 0, true);
+  // Record header (big-endian)
+  shpV.setInt32(100, 1, false);          // record number
+  shpV.setInt32(104, contentLen, false); // content length in 16-bit words
+  // Record content (little-endian)
+  let o=108;
+  shpV.setInt32(o, 5, true); o+=4;         // shape type
+  shpV.setFloat64(o, xMin, true); o+=8;
+  shpV.setFloat64(o, yMin, true); o+=8;
+  shpV.setFloat64(o, xMax, true); o+=8;
+  shpV.setFloat64(o, yMax, true); o+=8;
+  shpV.setInt32(o, 1, true); o+=4;          // num parts
+  shpV.setInt32(o, n, true); o+=4;          // num points
+  shpV.setInt32(o, 0, true); o+=4;          // parts[0]
+  coords.forEach(([x,y])=>{shpV.setFloat64(o,x,true);o+=8;shpV.setFloat64(o,y,true);o+=8;});
+
+  // ── .SHX ──
+  const shxBuf=new ArrayBuffer(108);
+  const shxV=new DataView(shxBuf);
+  shxV.setInt32(0,9994,false);
+  shxV.setInt32(24,54,false);  // file length = 50 + 4 = 54 words
+  shxV.setInt32(28,1000,true);
+  shxV.setInt32(32,5,true);
+  shxV.setFloat64(36,xMin,true);shxV.setFloat64(44,yMin,true);
+  shxV.setFloat64(52,xMax,true);shxV.setFloat64(60,yMax,true);
+  shxV.setFloat64(68,0,true);shxV.setFloat64(76,0,true);
+  shxV.setFloat64(84,0,true);shxV.setFloat64(92,0,true);
+  shxV.setInt32(100,50,false);           // offset of record 1
+  shxV.setInt32(104,contentLen,false);   // content length
+
+  // ── .PRJ — WGS84 ──
+  const prj='GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]';
+
+  // ── .DBF — dBASE III ──
+  // Campos: ID(N,4), AREA_M2(N,14,3), AREA_HA(N,14,6), VERTICES(N,4), GNSS(C,60)
+  const m2=areaM2(pts),ha=m2/10000;
+  const cons=detectConstellations();
+  const gnssStr=Object.keys(cons).filter(k=>cons[k]).join(',').substring(0,60);
+  const fields=[
+    {name:'ID',      type:'N',len:4, dec:0},
+    {name:'AREA_M2', type:'N',len:14,dec:3},
+    {name:'AREA_HA', type:'N',len:14,dec:6},
+    {name:'VERTICES',type:'N',len:4, dec:0},
+    {name:'GNSS',    type:'C',len:60,dec:0},
+  ];
+  const headerSize=32+fields.length*32+1;
+  const recSize=1+fields.reduce((s,f)=>s+f.len,0);
+  const dbfBuf=new ArrayBuffer(headerSize+recSize);
+  const dbfV=new DataView(dbfBuf);
+  const dbfU=new Uint8Array(dbfBuf);
+  const d=new Date();
+  dbfV.setUint8(0,3);
+  dbfV.setUint8(1,d.getFullYear()-1900);
+  dbfV.setUint8(2,d.getMonth()+1);
+  dbfV.setUint8(3,d.getDate());
+  dbfV.setInt32(4,1,true);               // num records
+  dbfV.setUint16(8,headerSize,true);
+  dbfV.setUint16(10,recSize,true);
+  fields.forEach((f,i)=>{
+    const off=32+i*32;
+    const nb=new TextEncoder().encode(f.name.padEnd(11,'\0'));
+    nb.forEach((b,j)=>dbfU[off+j]=b);
+    dbfU[off+11]=f.type.charCodeAt(0);
+    dbfV.setUint8(off+16,f.len);
+    dbfV.setUint8(off+17,f.dec);
+  });
+  dbfU[32+fields.length*32]=0x0D; // terminator
+  // Write record
+  const recOff=headerSize;
+  dbfU[recOff]=0x20; // valid record
+  let rp=recOff+1;
+  const writeField=(val,len)=>{
+    const s=String(val).substring(0,len).padStart(len,' ');
+    new TextEncoder().encode(s).forEach((b,j)=>dbfU[rp+j]=b);
+    rp+=len;
+  };
+  writeField(1,4);
+  writeField(m2.toFixed(3),14);
+  writeField(ha.toFixed(6),14);
+  writeField(pts.length,4);
+  writeField(gnssStr,60);
+
+  // ── ZIP (store, no compression) ──
+  // Simple zip: local file headers + central directory
+  function crc32(buf){
+    const t=new Uint8Array(buf);
+    let c=0xFFFFFFFF;
+    for(let i=0;i<t.length;i++){c^=t[i];for(let j=0;j<8;j++)c=c&1?(c>>>1)^0xEDB88320:(c>>>1);}
+    return(c^0xFFFFFFFF)>>>0;
+  }
+  function zipEntry(name,data){
+    const nb=new TextEncoder().encode(name);
+    const hdr=new ArrayBuffer(30+nb.length);
+    const hv=new DataView(hdr);const hu=new Uint8Array(hdr);
+    hv.setUint32(0,0x04034B50,true);hv.setUint16(4,20,true);hv.setUint16(6,0,true);
+    hv.setUint16(8,0,true);hv.setUint16(10,0,true);hv.setUint16(12,0,true);
+    const crc=crc32(data);
+    hv.setUint32(14,crc,true);
+    hv.setUint32(18,data.byteLength,true);hv.setUint32(22,data.byteLength,true);
+    hv.setUint16(26,nb.length,true);hv.setUint16(28,0,true);
+    nb.forEach((b,i)=>hu[30+i]=b);
+    return{local:new Uint8Array([...new Uint8Array(hdr),...new Uint8Array(data instanceof ArrayBuffer?data:new TextEncoder().encode(data))]),crc,size:data.byteLength||new TextEncoder().encode(data).length,name,nb};
+  }
+  const entries=[
+    zipEntry('levantamento.shp',shpBuf),
+    zipEntry('levantamento.shx',shxBuf),
+    zipEntry('levantamento.dbf',dbfBuf),
+    zipEntry('levantamento.prj',prj),
+  ];
+  let offset=0;
+  const locals=entries.map(e=>{const b=e.local;offset+=b.length;return b;});
+  const cdOffset=offset;
+  const centrals=entries.map((e,i)=>{
+    const off=entries.slice(0,i).reduce((s,x)=>s+x.local.length,0);
+    const nb=new TextEncoder().encode(e.name);
+    const cd=new ArrayBuffer(46+nb.length);
+    const cv=new DataView(cd);const cu=new Uint8Array(cd);
+    cv.setUint32(0,0x02014B50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);
+    cv.setUint16(8,0,true);cv.setUint16(10,0,true);cv.setUint16(12,0,true);cv.setUint16(14,0,true);
+    cv.setUint32(16,e.crc,true);cv.setUint32(20,e.size,true);cv.setUint32(24,e.size,true);
+    cv.setUint16(28,nb.length,true);cv.setUint16(30,0,true);cv.setUint16(32,0,true);
+    cv.setUint16(34,0,true);cv.setUint16(36,0,true);cv.setUint32(38,0,true);cv.setUint32(42,off,true);
+    nb.forEach((b,j)=>cu[46+j]=b);
+    return new Uint8Array(cd);
+  });
+  const cdSize=centrals.reduce((s,c)=>s+c.length,0);
+  const eocd=new ArrayBuffer(22);
+  const ev=new DataView(eocd);
+  ev.setUint32(0,0x06054B50,true);ev.setUint16(4,0,true);ev.setUint16(6,0,true);
+  ev.setUint16(8,entries.length,true);ev.setUint16(10,entries.length,true);
+  ev.setUint32(12,cdSize,true);ev.setUint32(16,cdOffset,true);ev.setUint16(20,0,true);
+
+  const all=[...locals,...centrals,new Uint8Array(eocd)];
+  const totalLen=all.reduce((s,a)=>s+a.length,0);
+  const zip=new Uint8Array(totalLen);
+  let pos=0;all.forEach(a=>{zip.set(a,pos);pos+=a.length;});
+
+  dl('shapefile_gnss_'+Date.now()+'.zip',zip.buffer,'application/zip');
+  toast('Shapefile (.zip) exportado!');
+}
+
+// ── Relatório Topográfico HTML ──
+function exportRelatorio(){
+  if(pts.length<3){toast('Mínimo 3 vértices para o relatório');return;}
+  const m2=areaM2(pts),ha=m2/10000;
+  const alqP=ha/2.42,alqM=ha/4.84;
+  const cons=detectConstellations();
+  const gnssStr=Object.keys(cons).filter(k=>cons[k]).join(', ');
+  const rms=rmsOf(pts.map(p=>p.rms||p.acc))||0;
+  const accMed=pts.reduce((s,p)=>s+p.acc,0)/pts.length;
+  const hdopMed=pts.filter(p=>p.hdop).reduce((s,p)=>s+p.hdop,0)/Math.max(1,pts.filter(p=>p.hdop).length);
+  const now=new Date();
+  const ts=now.toLocaleString('pt-BR');
+  const u0=toUTM(pts[0].lat,pts[0].lon);
+
+  // Calcular azimutes e distâncias entre vértices consecutivos
+  function haversine(a,b){
+    const R=6371000,toR=d=>d*Math.PI/180;
+    const dLat=toR(b.lat-a.lat),dLon=toR(b.lon-a.lon);
+    const x=Math.sin(dLat/2)**2+Math.cos(toR(a.lat))*Math.cos(toR(b.lat))*Math.sin(dLon/2)**2;
+    return 2*R*Math.asin(Math.sqrt(x));
+  }
+  function azimute(a,b){
+    const toR=d=>d*Math.PI/180,toDeg=r=>r*180/Math.PI;
+    const dLon=toR(b.lon-a.lon);
+    const az=Math.atan2(Math.sin(dLon)*Math.cos(toR(b.lat)),
+      Math.cos(toR(a.lat))*Math.sin(toR(b.lat))-Math.sin(toR(a.lat))*Math.cos(toR(b.lat))*Math.cos(dLon));
+    return(toDeg(az)+360)%360;
+  }
+  const perimetro=pts.reduce((s,p,i)=>s+haversine(p,pts[(i+1)%pts.length]),0);
+
+  const linhasVertices=pts.map((p,i)=>{
+    const u=toUTM(p.lat,p.lon);
+    const prox=pts[(i+1)%pts.length];
+    const dist=haversine(p,prox).toFixed(3);
+    const az=azimute(p,prox).toFixed(4);
+    return `<tr>
+      <td>V${i+1}</td>
+      <td>${p.lat.toFixed(8)}</td>
+      <td>${p.lon.toFixed(8)}</td>
+      <td>${u.zone}${u.hem}</td>
+      <td>${Math.round(u.E)}</td>
+      <td>${Math.round(u.N)}</td>
+      <td>${p.alt!=null?p.alt.toFixed(2):'—'}</td>
+      <td>${p.acc.toFixed(3)}</td>
+      <td>${p.hdop?'~'+p.hdop.toFixed(2):'—'}</td>
+      <td>${dist}</td>
+      <td>${az}°</td>
+    </tr>`;
+  }).join('');
+
+  const html=`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Relatório Topográfico GNSS</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'DM Sans',sans-serif;background:#f4f3ee;color:#1a1a18;padding:20px;max-width:960px;margin:auto}
+  .header{background:#2d5a0e;color:#c8e89a;padding:24px 28px;border-radius:12px;margin-bottom:20px}
+  .header h1{font-size:20px;font-weight:600;letter-spacing:1px;margin-bottom:4px}
+  .header p{font-size:12px;opacity:0.7;font-family:'IBM Plex Mono',monospace}
+  .section{background:#fff;border-radius:10px;padding:20px 24px;margin-bottom:16px;border:0.5px solid rgba(0,0,0,0.08)}
+  .section h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.6px;color:#3b6d11;margin-bottom:14px;border-bottom:1px solid #eaf3de;padding-bottom:8px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+  .kv{background:#f8f7f2;border-radius:8px;padding:10px 14px}
+  .kv-l{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:3px}
+  .kv-v{font-size:16px;font-weight:600;color:#1a1a18}
+  .kv-s{font-size:11px;color:#666;margin-top:2px}
+  table{width:100%;border-collapse:collapse;font-size:11px}
+  th{background:#eaf3de;color:#3b6d11;font-weight:600;padding:7px 8px;text-align:left;font-size:10px;letter-spacing:0.4px;text-transform:uppercase}
+  td{padding:6px 8px;border-bottom:0.5px solid #f0ede8;font-family:'IBM Plex Mono',monospace}
+  tr:hover td{background:#f8faf5}
+  .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:500}
+  .badge.ok{background:#eaf3de;color:#3b6d11}
+  .badge.warn{background:#faeeda;color:#854f0b}
+  .footer{font-size:10px;color:#aaa;text-align:center;margin-top:20px;font-family:'IBM Plex Mono',monospace}
+  .gnss-badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  .gnss-b{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:500}
+  .GPS{background:#e6f1fb;color:#185fa5}
+  .GLONASS{background:#fbe8e0;color:#8b3a1a}
+  .Galileu{background:#eaf3de;color:#3b6d11}
+  .BeiDou{background:#faf5da;color:#7a6010}
+  @media print{body{background:#fff;padding:0} .section{border:1px solid #ddd}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>TOPOGRAFIA_GNSS — Relatório de Levantamento</h1>
+  <p>Gerado em: ${ts} &nbsp;|&nbsp; App: TOPOGRAFIA_GNSS v1.0 &nbsp;|&nbsp; Datum: WGS84 / SIRGAS2000</p>
+</div>
+
+<div class="section">
+  <h2>Resumo da Área</h2>
+  <div class="grid">
+    <div class="kv"><div class="kv-l">Área</div><div class="kv-v">${ha>=1?ha.toFixed(4)+' ha':m2.toFixed(2)+' m²'}</div><div class="kv-s">${m2.toFixed(3)} m²</div></div>
+    <div class="kv"><div class="kv-l">Alqueire Paulista</div><div class="kv-v">${alqP.toFixed(4)}</div><div class="kv-s">1 alq = 2,42 ha</div></div>
+    <div class="kv"><div class="kv-l">Alqueire Mineiro</div><div class="kv-v">${alqM.toFixed(4)}</div><div class="kv-s">1 alq = 4,84 ha</div></div>
+    <div class="kv"><div class="kv-l">Perímetro</div><div class="kv-v">${perimetro.toFixed(2)} m</div><div class="kv-s">${(perimetro/1000).toFixed(4)} km</div></div>
+    <div class="kv"><div class="kv-l">Vértices</div><div class="kv-v">${pts.length}</div><div class="kv-s">polígono fechado</div></div>
+    <div class="kv"><div class="kv-l">Zona UTM</div><div class="kv-v">${u0.zone}${u0.hem}</div><div class="kv-s">WGS84</div></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Qualidade GNSS</h2>
+  <div class="grid">
+    <div class="kv"><div class="kv-l">RMS Médio</div><div class="kv-v">${rms.toFixed(3)} m</div><div class="kv-s">Root Mean Square</div></div>
+    <div class="kv"><div class="kv-l">Precisão Média</div><div class="kv-v">±${accMed.toFixed(2)} m</div><div class="kv-s">erro circular 95%</div></div>
+    <div class="kv"><div class="kv-l">HDOP Médio</div><div class="kv-v">${hdopMed.toFixed(2)}</div><div class="kv-s">${hdopMed<=2?'Excelente':hdopMed<=5?'Bom':'Moderado'}</div></div>
+    <div class="kv"><div class="kv-l">Classificação</div><div class="kv-v"><span class="badge ${rms<=5?'ok':'warn'}">${rms<=3?'Geod. A':rms<=5?'Geod. B':rms<=15?'Cadastral':'Reconhecimento'}</span></div></div>
+  </div>
+  <div style="margin-top:14px">
+    <div style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.4px">Constelações ativas</div>
+    <div class="gnss-badges">
+      ${Object.entries(cons).filter(([,v])=>v).map(([k])=>`<span class="gnss-b ${k}">${k}</span>`).join('')}
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Memorial Descritivo dos Vértices</h2>
+  <div style="overflow-x:auto">
+  <table>
+    <tr>
+      <th>Vértice</th><th>Latitude (°)</th><th>Longitude (°)</th>
+      <th>Fuso</th><th>E (m)</th><th>N (m)</th>
+      <th>Alt (m)</th><th>Prec (m)</th><th>HDOP</th>
+      <th>Dist. próx (m)</th><th>Azimute</th>
+    </tr>
+    ${linhasVertices}
+  </table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Informações Técnicas</h2>
+  <div class="grid">
+    <div class="kv"><div class="kv-l">Datum Horizontal</div><div class="kv-v">WGS84</div><div class="kv-s">SIRGAS2000 (coincidente)</div></div>
+    <div class="kv"><div class="kv-l">Projeção</div><div class="kv-v">UTM Fuso ${u0.zone}${u0.hem}</div><div class="kv-s">Transversa de Mercator</div></div>
+    <div class="kv"><div class="kv-l">Cálculo de Área</div><div class="kv-v">Shoelace</div><div class="kv-s">Proj. equiretangular local</div></div>
+    <div class="kv"><div class="kv-l">Sistemas GNSS</div><div class="kv-v" style="font-size:13px">${gnssStr}</div></div>
+    <div class="kv"><div class="kv-l">Data/Hora início</div><div class="kv-v" style="font-size:12px">${pts[0].ts.replace('T',' ').substring(0,19)}</div></div>
+    <div class="kv"><div class="kv-l">Data/Hora fim</div><div class="kv-v" style="font-size:12px">${pts[pts.length-1].ts.replace('T',' ').substring(0,19)}</div></div>
+  </div>
+</div>
+
+<div class="footer">
+  TOPOGRAFIA_GNSS &nbsp;·&nbsp; Levantamento com receptor multi-constelação GNSS &nbsp;·&nbsp; WGS84/SIRGAS2000<br/>
+  Este relatório é gerado automaticamente a partir de dados coletados em campo. Conferir com profissional habilitado.
+</div>
+</body>
+</html>`;
+
+  dl('relatorio_topografico_'+Date.now()+'.html', html, 'text/html');
+  toast('Relatório HTML exportado!');
 }
 
 startWatch();
