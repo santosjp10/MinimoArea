@@ -203,6 +203,41 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
 .act.rep:active{background:rgba(140,210,80,0.07)}
 .act.clr{color:rgba(220,90,90,0.7);border-color:rgba(220,90,90,0.16)}
 .act.clr:active{background:rgba(220,90,90,0.07)}
+.act.sav{color:#ffd080;border-color:rgba(255,208,128,0.2)}
+.act.sav:active{background:rgba(255,208,128,0.08)}
+.act.lod{color:#80d4ff;border-color:rgba(128,212,255,0.2)}
+.act.lod:active{background:rgba(128,212,255,0.08)}
+
+/* Download modal — shown when programmatic download is blocked */
+.dl-modal{
+  position:fixed;inset:0;z-index:200;
+  background:rgba(0,0,0,0.7);
+  display:flex;align-items:flex-end;justify-content:center;
+  padding-bottom:max(env(safe-area-inset-bottom),20px);
+  opacity:0;pointer-events:none;transition:opacity 0.25s;
+}
+.dl-modal.show{opacity:1;pointer-events:auto}
+.dl-box{
+  background:rgba(12,15,20,0.97);border:0.5px solid rgba(255,255,255,0.15);
+  border-radius:20px 20px 16px 16px;padding:20px 20px 10px;
+  width:100%;max-width:460px;
+}
+.dl-title{font-size:14px;font-weight:600;color:#e8f4d8;margin-bottom:6px}
+.dl-hint{font-size:12px;color:rgba(255,255,255,0.45);margin-bottom:14px;line-height:1.5}
+.dl-link{
+  display:block;width:100%;padding:14px;border-radius:12px;
+  background:#3a7010;color:#c8e89a;border:none;
+  font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;
+  text-align:center;text-decoration:none;cursor:pointer;
+  margin-bottom:8px;
+}
+.dl-link:active{background:#2d5a0a}
+.dl-cancel{
+  display:block;width:100%;padding:12px;border-radius:12px;
+  background:none;color:rgba(255,255,255,0.4);border:0.5px solid rgba(255,255,255,0.1);
+  font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer;margin-bottom:6px;
+}
+.dl-cancel:active{background:rgba(255,255,255,0.06)}
 
 /* Toast */
 .toast{
@@ -293,7 +328,14 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
     <div class="empty-hint">Posicione-se no vértice<br>e toque no botão capturar</div>
   </div>
 
-  <div class="acts-label">Exportar</div>
+  <div class="acts-label">Projeto</div>
+  <div class="acts">
+    <button class="act sav" onclick="salvarProjeto()">💾 Salvar Projeto</button>
+    <button class="act lod" onclick="document.getElementById('fi-projeto').click()">📂 Carregar Projeto</button>
+    <input type="file" id="fi-projeto" accept=".tgnss,.json" style="display:none" onchange="carregarProjeto(event)">
+  </div>
+
+  <div class="acts-label" style="margin-top:6px">Exportar</div>
   <div class="acts">
     <button class="act exp" onclick="exportGeoJSON()">↓ GeoJSON</button>
     <button class="act exp" onclick="exportCSV()">↓ CSV</button>
@@ -301,6 +343,16 @@ html,body{width:100%;height:100%;overflow:hidden;font-family:'DM Sans',sans-seri
     <button class="act exp shp" onclick="exportShapefile()">↓ Shapefile</button>
     <button class="act exp rep" style="grid-column:1/-1" onclick="exportRelatorio()">↓ Relatório Topográfico</button>
     <button class="act clr" style="grid-column:1/-1" onclick="clearAll()">✕ Limpar todos os pontos</button>
+  </div>
+</div>
+
+<!-- Download modal — fallback para Android/iOS que bloqueiam clique programático -->
+<div class="dl-modal" id="dl-modal" onclick="closeDlModal(event)">
+  <div class="dl-box">
+    <div class="dl-title" id="dl-title">Arquivo pronto</div>
+    <div class="dl-hint" id="dl-hint">Toque no botão abaixo para baixar. Se o download não iniciar, mantenha pressionado e escolha "Salvar link".</div>
+    <a class="dl-link" id="dl-link" download="">⬇ Baixar arquivo</a>
+    <button class="dl-cancel" onclick="closeDlModal()">Fechar</button>
   </div>
 </div>
 
@@ -745,9 +797,146 @@ function exportCSV(){
   dl('vertices_gnss_'+Date.now()+'.csv',csv,'text/csv');
   toast('CSV exportado!');
 }
-function dl(name,content,mime){
-  const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([content],{type:mime})),download:name});
-  document.body.appendChild(a);a.click();document.body.removeChild(a);
+// ── Download — estratégia robusta para Android/iOS ──
+// Android WebView e Safari bloqueiam cliques programáticos em <a download>.
+// Estratégia: tenta clique direto → se falhar ou for iOS/Android abre modal com link visível.
+function dl(name, content, mime){
+  let url;
+  try{
+    const blob = content instanceof ArrayBuffer
+      ? new Blob([content], {type: mime})
+      : new Blob([content], {type: mime});
+    url = URL.createObjectURL(blob);
+  }catch(e){
+    // Fallback: data URI (sem revokeObjectURL necessário)
+    const b64 = content instanceof ArrayBuffer
+      ? btoa(String.fromCharCode(...new Uint8Array(content)))
+      : btoa(unescape(encodeURIComponent(content)));
+    url = 'data:'+mime+';base64,'+b64;
+  }
+
+  // Tenta download programático
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.style.display='none';
+  document.body.appendChild(a);
+
+  let clicked = false;
+  try{ a.click(); clicked = true; }catch(e){}
+  document.body.removeChild(a);
+
+  // Detecta iOS/Android ou se o clique foi bloqueado → abre modal
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isAndroid = /Android/i.test(navigator.userAgent);
+
+  if(!clicked || isIOS || isAndroid){
+    openDlModal(name, url, mime);
+    return;
+  }
+
+  // Desktop: revoga URL após 10s
+  if(url.startsWith('blob:')) setTimeout(()=>URL.revokeObjectURL(url), 10000);
+}
+
+function openDlModal(name, url, mime){
+  const modal = document.getElementById('dl-modal');
+  const link  = document.getElementById('dl-link');
+  const title = document.getElementById('dl-title');
+  const hint  = document.getElementById('dl-hint');
+
+  link.href     = url;
+  link.download = name;
+  link.textContent = '⬇ Baixar ' + name;
+  title.textContent = 'Arquivo pronto para download';
+
+  const ext = name.split('.').pop().toUpperCase();
+  const hints = {
+    ZIP:  'Arquivo Shapefile (.zip). Toque e segure → "Salvar link" se o download não iniciar.',
+    KML:  'Arquivo KML para Google Earth / QGIS. Toque para baixar.',
+    HTML: 'Relatório HTML. Toque para abrir/salvar — use "Compartilhar → Salvar" no Safari.',
+    CSV:  'Planilha CSV. Toque para baixar.',
+    JSON: 'GeoJSON. Toque para baixar.',
+    TGNSS:'Projeto TOPOGRAFIA_GNSS. Toque para salvar.',
+  };
+  hint.textContent = hints[ext] || 'Toque no botão para baixar o arquivo.';
+
+  modal.classList.add('show');
+  // Revoga blob após 2 min
+  if(url.startsWith('blob:')) setTimeout(()=>URL.revokeObjectURL(url), 120000);
+}
+
+function closeDlModal(e){
+  if(e && e.target !== document.getElementById('dl-modal') && !e.target.classList.contains('dl-cancel')) return;
+  document.getElementById('dl-modal').classList.remove('show');
+}
+
+// ── Salvar Projeto (.tgnss) ──
+function salvarProjeto(){
+  if(!pts.length){toast('Nenhum ponto para salvar');return;}
+  const projeto = {
+    versao: '1.0',
+    app: 'TOPOGRAFIA_GNSS',
+    salvo_em: new Date().toISOString(),
+    datum: 'WGS84',
+    pontos: pts,
+    meta: {
+      gnss: Object.keys(detectConstellations()).filter(k=>detectConstellations()[k]),
+      total_vertices: pts.length,
+      area_m2: pts.length>=3 ? +areaM2(pts).toFixed(4) : null,
+      area_ha: pts.length>=3 ? +(areaM2(pts)/10000).toFixed(8) : null,
+    }
+  };
+  const json = JSON.stringify(projeto, null, 2);
+  const nome = 'projeto_gnss_'+new Date().toISOString().replace(/[:.]/g,'-').substring(0,19)+'.tgnss';
+  dl(nome, json, 'application/json');
+  toast('Projeto salvo: '+nome);
+}
+
+// ── Carregar Projeto (.tgnss / .json) ──
+function carregarProjeto(ev){
+  const file = ev.target.files[0];
+  if(!file){return;}
+  const reader = new FileReader();
+  reader.onload = (e)=>{
+    try{
+      const obj = JSON.parse(e.target.result);
+      // Valida estrutura mínima
+      if(!obj.pontos || !Array.isArray(obj.pontos)){
+        toast('Arquivo inválido — sem pontos');return;
+      }
+      const required = ['lat','lon','acc','ts'];
+      const validos = obj.pontos.filter(p=>required.every(k=>p[k]!==undefined));
+      if(!validos.length){toast('Nenhum vértice válido no arquivo');return;}
+
+      // Confirmação se já existem pontos
+      if(pts.length>0){
+        if(!confirm('Substituir os '+pts.length+' ponto(s) atual(is) pelos '+validos.length+' do projeto?')) return;
+      }
+
+      pts = validos;
+      mkrGroup.clearLayers();
+      polyGroup.clearLayers();
+      if(accCircle){map.removeLayer(accCircle);accCircle=null;}
+
+      rebuildMarkers();
+      renderPoly();
+      renderSheet();
+      renderChip();
+
+      // Centraliza no polígono carregado
+      if(pts.length>=2){
+        const ll=pts.map(p=>[p.lat,p.lon]);
+        map.fitBounds(L.latLngBounds(ll),{padding:[90,90],maxZoom:19,animate:true});
+      }
+
+      const meta = obj.meta||{};
+      const dtSalvo = obj.salvo_em ? new Date(obj.salvo_em).toLocaleString('pt-BR') : '?';
+      toast(validos.length+' vértices carregados · salvo em '+dtSalvo);
+    }catch(err){
+      toast('Erro ao ler projeto: '+err.message, 4000);
+    }
+  };
+  reader.readAsText(file);
+  ev.target.value=''; // reset para permitir recarregar o mesmo arquivo
 }
 
 // ── KML+ Export ──
